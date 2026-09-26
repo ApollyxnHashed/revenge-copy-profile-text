@@ -1,2 +1,13 @@
 packages:
   - plugins/*
+
+# pnpm 10+ blocks postinstall/build scripts by default for security.
+# @swc/core and esbuild both need theirs to run (they fetch native
+# binaries), so this repo explicitly allows all of them.
+dangerouslyAllowAllBuilds: true
+
+peerDependencyRules:
+  ignoreMissing:
+    - react
+    - react-native
+    
