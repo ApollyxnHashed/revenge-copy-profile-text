@@ -1,0 +1,13 @@
+{
+  "name": "CopyProfileText",
+  "description": "Makes bio, pronoun and custom status text selectable/copyable on user profiles.",
+  "authors": [
+    {
+      "name": "seu-nome-aqui"
+    }
+  ],
+  "main": "src/index.ts",
+  "vendetta": {
+    "icon": "ic_profile_24px"
+  }
+}
