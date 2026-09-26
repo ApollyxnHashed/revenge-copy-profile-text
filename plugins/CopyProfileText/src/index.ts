@@ -1,5 +1,5 @@
 import { findByName } from "@vendetta/metro";
-import { ReactNative } from "@vendetta/metro/common";
+import { ReactNative, React } from "@vendetta/metro/common";
 import { after, unpatchAll } from "@vendetta/patcher";
 
 /**
@@ -88,13 +88,12 @@ let bioPatched = false;
 let retryHandle: ReturnType<typeof setInterval> | undefined;
 
 /**
- * Patches the whole profile popup/sheet at once. Bio, pronouns and custom
- * status are all just <Text> nodes somewhere inside what this component
- * renders, so hooking this one, comparatively stable entry point makes
- * all three (and anything else Discord adds to that screen later)
- * selectable, without needing to know the exact internal name of each
- * individual field - several of which (like the pronouns row) aren't
- * even reachable as standalone Metro modules to begin with.
+ * Patches the whole profile popup/sheet at once. Kept as one layer of
+ * defense: covers any <Text> that's a *direct*, already-resolved
+ * descendant of what this component itself returns. It does NOT reach
+ * text rendered by a nested child component's own render call (that
+ * child hasn't run yet at this point) - which is exactly why pronouns
+ * and status needed the createElement/jsx patch below as well.
  */
 function patchWholeProfile(): boolean {
     const UserProfile = findUserProfile();
@@ -137,6 +136,96 @@ function patchBioText(): boolean {
     return true;
 }
 
+/**
+ * The pronouns row and the custom-status bubble are each rendered by
+ * their own nested child component (not a plain <Text> written directly
+ * in UserProfileContent's own JSX, and not a clean top-level Metro
+ * export we can findByName either) - so neither patchWholeProfile() nor
+ * patchBioText() ever sees their actual <Text> output.
+ *
+ * Instead of guessing that child component's name, this patches the
+ * functions React itself calls to create *every* element in the app -
+ * React.createElement, plus the jsx/jsxs/jsxDEV runtime Discord's bundle
+ * actually compiles down to - and marks any element being created as a
+ * native <Text> selectable right then, regardless of which component
+ * created it or how deeply it's nested. That covers pronouns, status,
+ * and bio (redundantly - harmless) all at once, and keeps working even
+ * if Discord renames/restructures the profile popup again.
+ *
+ * Same technique (and largely the same implementation) used by other
+ * real Revenge plugins - e.g. Staff Tags - to reach components that
+ * aren't reachable via a normal findByName lookup.
+ */
+function patchTextCreation(): void {
+    function interceptElementCreation(args: any[], res: any): any {
+        if (!res || typeof res !== "object") return res;
+        if (args[0] === ReactNative.Text && res.props) {
+            res.props.selectable = true;
+            if (typeof res.props.onPress !== "function") {
+                res.props.onPress = () => {};
+            }
+        }
+        return res;
+    }
+
+    if (typeof React?.createElement === "function") {
+        after("createElement", React, interceptElementCreation);
+    }
+
+    const patchedJsxRuntimes = new WeakSet<any>();
+
+    function isJsxRuntime(m: any): boolean {
+        return typeof m?.jsx === "function" || typeof m?.jsxs === "function" || typeof m?.jsxDEV === "function";
+    }
+
+    function patchJsxObject(runtime: any): void {
+        if (patchedJsxRuntimes.has(runtime)) return;
+        patchedJsxRuntimes.add(runtime);
+        for (const key of ["jsx", "jsxs", "jsxDEV"] as const) {
+            if (typeof runtime[key] !== "function") continue;
+            after(key, runtime, interceptElementCreation);
+        }
+    }
+
+    function scanAndPatchJsxRuntimes(): void {
+        // @ts-ignore - injected by Discord's Metro/Hermes runtime
+        const modules = (typeof window !== "undefined" ? window.modules : undefined) ?? (globalThis as any).modules;
+        if (!modules) return;
+
+        for (const id in modules) {
+            const def = modules[id];
+            if (!def?.isInitialized) continue;
+
+            const exports = def.publicModule?.exports;
+            if (!exports) continue;
+
+            try {
+                if (isJsxRuntime(exports)) patchJsxObject(exports);
+                const dflt = exports.default;
+                if (dflt != null && isJsxRuntime(dflt)) patchJsxObject(dflt);
+            } catch {
+                // A weirdly-shaped module shouldn't stop the scan.
+            }
+        }
+    }
+
+    // Discord's JSX runtime module isn't always registered yet when this
+    // plugin loads, so keep re-scanning for a while (Metro registers
+    // modules lazily as screens get visited) instead of only checking once.
+    scanAndPatchJsxRuntimes();
+
+    let jsxTicks = 0;
+    jsxScanHandle = setInterval(() => {
+        scanAndPatchJsxRuntimes();
+        if (++jsxTicks >= 80) { // ~24s at 300ms
+            if (jsxScanHandle) clearInterval(jsxScanHandle);
+            jsxScanHandle = undefined;
+        }
+    }, 300);
+}
+
+let jsxScanHandle: ReturnType<typeof setInterval> | undefined;
+
 function stopRetrying() {
     if (retryHandle) {
         clearInterval(retryHandle);
@@ -162,7 +251,13 @@ if (!(profilePatched && bioPatched)) {
     }, 300);
 }
 
+patchTextCreation();
+
 export const onUnload = () => {
     stopRetrying();
+    if (jsxScanHandle) {
+        clearInterval(jsxScanHandle);
+        jsxScanHandle = undefined;
+    }
     unpatchAll();
 };
